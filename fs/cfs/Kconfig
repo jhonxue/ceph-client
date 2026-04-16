@@ -1,0 +1,22 @@
+config CFS_FS
+	tristate "CFS - Ceph File System Simple"
+	depends on CEPH_LIB
+	select NLS
+	help
+	  CFS is a simple file system that stores metadata and data in
+	  Ceph RADOS object store. It is designed for simple distributed
+	  file storage with:
+	  
+	  - Metadata stored in RADOS omap (key-value store)
+	  - File data stored in 4MB sliced objects
+	  - POSIX-compliant file system interface
+	  
+	  Metadata (directory entries, inode attributes) are stored in
+	  the meta pool using omap, with directory entries keyed by
+	  hash_filename format.
+	  
+	  File data is sliced into 4MB chunks and stored in data pool
+	  objects named inode.partnum.
+	  
+	  To compile this file system as a module, choose M here.
+	  If unsure, say N.
