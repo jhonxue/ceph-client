@@ -11,6 +11,7 @@
 #include <linux/slab.h>
 #include <linux/mm.h>
 #include <linux/ceph/osd_client.h>
+#include <linux/netfs.h>
 
 #include "super.h"
 #include "internal.h"
@@ -41,40 +42,35 @@ int cfs_file_release(struct inode *inode, struct file *file)
 }
 
 /*
- * Read iteration - uses address space operations
+ * Read iteration - uses netfs framework
  */
 ssize_t cfs_file_read_iter(struct kiocb *iocb, struct iov_iter *iter)
 {
 	struct inode *inode = file_inode(iocb->ki_filp);
 	struct cfs_inode_info *ci = CFS_I(inode);
-	ssize_t ret;
 
 	cfs_debug("file_read_iter: ino=%llu, pos=%lld, count=%zu\n",
 		  ci->i_ino, iocb->ki_pos, iov_iter_count(iter));
 
-	ret = generic_file_read_iter(iocb, iter);
-	return ret;
+	return netfs_file_read_iter(iocb, iter);
 }
 
 /*
- * Write iteration - uses address space operations
+ * Write iteration - uses netfs framework
  */
 ssize_t cfs_file_write_iter(struct kiocb *iocb, struct iov_iter *iter)
 {
- struct inode *inode = file_inode(iocb->ki_filp);
- struct cfs_inode_info *ci = CFS_I(inode);
- ssize_t ret;
+	struct inode *inode = file_inode(iocb->ki_filp);
+	struct cfs_inode_info *ci = CFS_I(inode);
 
- cfs_debug("file_write_iter: ino=%llu, pos=%lld, count=%zu\n",
- 	  ci->i_ino, iocb->ki_pos, iov_iter_count(iter));
+	cfs_debug("file_write_iter: ino=%llu, pos=%lld, count=%zu\n",
+		  ci->i_ino, iocb->ki_pos, iov_iter_count(iter));
 
- /*
-  * generic_file_write_iter handles its own inode locking
-  * to avoid potential deadlocks with concurrent reads.
-  */
- ret = generic_file_write_iter(iocb, iter);
-
- return ret;
+	/*
+	 * netfs_file_write_iter handles its own inode locking
+	 * to avoid potential deadlocks with concurrent reads.
+	 */
+	return netfs_file_write_iter(iocb, iter);
 }
 
 /*

@@ -36,6 +36,8 @@ enum cfs_param {
 	Opt_meta_pool,
 	Opt_data_pool,
 	Opt_mode,
+	Opt_rsize,
+	Opt_wsize,
 };
 
 static const struct fs_parameter_spec cfs_fs_parameters[] = {
@@ -43,6 +45,8 @@ static const struct fs_parameter_spec cfs_fs_parameters[] = {
 	fsparam_string("meta_pool", Opt_meta_pool),
 	fsparam_string("data_pool", Opt_data_pool),
 	fsparam_u32oct("mode", Opt_mode),
+	fsparam_u32("rsize", Opt_rsize),
+	fsparam_u32("wsize", Opt_wsize),
 	{}
 };
 
@@ -80,6 +84,12 @@ static int cfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 		break;
 	case Opt_mode:
 		fsi->opts->mode = result.uint_32 & S_IALLUGO;
+		break;
+	case Opt_rsize:
+		fsi->opts->rsize = result.uint_32;
+		break;
+	case Opt_wsize:
+		fsi->opts->wsize = result.uint_32;
 		break;
 	default:
 		return -EINVAL;
@@ -210,7 +220,13 @@ static struct inode *cfs_alloc_inode(struct super_block *sb)
 	ci->i_parent_ino = 0;
 	ci->i_dir_count = 0;
 
-	return &ci->vfs_inode;
+	/*
+	 * Initialize netfs context with CFS netfs ops.
+	 * Netfs is always enabled for CFS - it provides the core I/O path.
+	 */
+	netfs_inode_init(&ci->netfs, &cfs_netfs_ops, false);
+
+	return &ci->netfs.inode;
 }
 
 /*
@@ -222,6 +238,27 @@ static void cfs_destroy_inode(struct inode *inode)
 
 	cfs_debug("destroy_inode: ino=%llu\n", ci->i_ino);
 	kmem_cache_free(cfs_inode_cachep, ci);
+}
+
+/*
+ * Update netfs context for the root inode.
+ * This ensures remote_i_size is correctly set after mount.
+ * Netfs ops are already set in cfs_alloc_inode().
+ */
+void cfs_update_root_inode_netfs(struct super_block *sb)
+{
+	struct inode *root_inode;
+	struct cfs_inode_info *ci;
+
+	/* Get the root inode - the only inode at mount time */
+	root_inode = sb->s_root->d_inode;
+	if (!root_inode)
+		return;
+
+	ci = CFS_I(root_inode);
+
+	/* Update remote_i_size to match current i_size */
+	ci->netfs.remote_i_size = i_size_read(root_inode);
 }
 
 /*
@@ -403,6 +440,12 @@ static int cfs_fill_super(struct super_block *sb, struct fs_context *fc)
 		cfs_err("failed to create root inode: %d\n", ret);
 		goto err_rados_cleanup;
 	}
+
+	/*
+	 * Update netfs context for root inode.
+	 * Netfs ops are already set in cfs_alloc_inode().
+	 */
+	cfs_update_root_inode_netfs(sb);
 
 	cfs_info("filesystem mounted successfully\n");
 	return 0;

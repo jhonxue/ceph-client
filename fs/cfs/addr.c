@@ -3,7 +3,7 @@
  * CFS - Ceph File System Simple
  *
  * Address space operations implementation
- * Handles file data read/write with 4MB slicing
+ * Uses netfs framework for all I/O operations (following ceph_aops pattern)
  */
 
 #include <linux/fs.h>
@@ -11,253 +11,29 @@
 #include <linux/bio.h>
 #include <linux/slab.h>
 #include <linux/mm.h>
+#include <linux/writeback.h>
+#include <linux/uio.h>
 #include <linux/ceph/osd_client.h>
+#include <linux/netfs.h>
 
 #include "super.h"
 #include "internal.h"
 #include "rados.h"
 
 /*
- * Read a single folio from RADOS
+ * CFS follows the same pattern as ceph_aops (fs/ceph/addr.c:1563-1574):
+ *
+ * - read operations: directly use netfs_read_folio, netfs_readahead
+ * - write operations: custom implementation via netfs_request_ops callbacks
+ * - release_folio: directly use netfs_release_folio
+ * - direct_IO: use noop_direct_IO (netfs handles DIO internally)
+ *
+ * The actual I/O operations are implemented in netfs.c via netfs_request_ops.
  */
-int cfs_read_folio(struct file *file, struct folio *folio)
-{
-	struct inode *inode = folio->file_mapping->host;
-	struct cfs_inode_info *ci = CFS_I(inode);
-	struct cfs_fs_info *fsi = CFS_SB(inode->i_sb);
-	struct page *page = folio_page(folio, 0);
-	struct page **pages;
-	loff_t pos = folio_pos(folio);
-	size_t len = folio_size(folio);
-	u64 file_size = i_size_read(inode);
-	u64 offset = pos;
-	u64 read_len;
-	u32 part_num;
-	struct ceph_object_id oid;
-	int ret;
-
-	cfs_debug("read_folio: ino=%llu, pos=%lld, len=%zu, file_size=%llu\n",
-		  ci->i_ino, pos, len, file_size);
-
-	/* Handle reads beyond EOF */
-	if (pos >= file_size) {
-		folio_zero_segment(folio, 0, len);
-		folio_mark_uptodate(folio);
-		folio_unlock(folio);
-		return 0;
-	}
-
-	/* Calculate read length */
-	read_len = min(len, file_size - pos);
-	if (read_len < len) {
-		/* Zero portion beyond EOF */
-		folio_zero_segment(folio, read_len, len);
-	}
-
-	/* Calculate which data object/part to read */
-	part_num = cfs_part_num(offset);
-
-	/* Read from RADOS */
-	cfs_data_oid(&oid, ci->i_ino, part_num);
-
-	/* Setup page pointer for read */
-	pages = &page;
-
-	ret = cfs_data_read(fsi, &oid, cfs_part_offset(offset),
-			    read_len, pages, 1);
-	if (ret) {
-		cfs_err("read_folio: failed to read: %d\n", ret);
-		folio_zero_segment(folio, 0, len);
-		folio_mark_uptodate(folio);
-		folio_unlock(folio);
-		return ret;
-	}
-
-	folio_mark_uptodate(folio);
-	folio_unlock(folio);
-	return 0;
-}
-
-/*
- * Read multiple pages from RADOS
- */
-static void cfs_readahead(struct readahead_control *rac)
-{
-	struct inode *inode = rac->file_mapping->host;
-	struct cfs_inode_info *ci = CFS_I(inode);
-	struct cfs_fs_info *fsi = CFS_SB(inode->i_sb);
-	loff_t file_size = i_size_read(inode);
-	struct page *page;
-	loff_t start = readahead_pos(rac);
-	size_t count = readahead_count(rac);
-	u64 offset, read_len, remaining;
-	u32 part_num, start_part;
-	struct ceph_object_id oid;
-	int ret;
-
-	cfs_debug("readahead: ino=%llu, start=%lld, count=%zu\n",
-		  ci->i_ino, start, count);
-
-	/* Handle reads beyond EOF */
-	if (start >= file_size)
-		return;
-
-	/* Calculate read parameters */
-	start_part = cfs_part_num(start);
-	remaining = min(count * PAGE_SIZE, file_size - start);
-
-	while (remaining > 0 && readahead_count(rac) > 0) {
-		page = readahead_page(rac);
-		if (!page)
-			break;
-
-		offset = page_offset(page);
-		part_num = cfs_part_num(offset);
-
-		read_len = min((u64)PAGE_SIZE, remaining);
-		read_len = min(read_len, cfs_part_remaining(offset, read_len));
-
-		/* Read from RADOS */
-		cfs_data_oid(&oid, ci->i_ino, part_num);
-		ret = cfs_data_read(fsi, &oid, cfs_part_offset(offset),
-				    read_len, &page, 1);
-
-		if (ret) {
-			SetPageError(page);
-			zero_user_segment(page, 0, PAGE_SIZE);
-		} else {
-			if (read_len < PAGE_SIZE)
-				zero_user_segment(page, read_len, PAGE_SIZE);
-			SetPageUptodate(page);
-		}
-
-		unlock_page(page);
-		put_page(page);
-
-		remaining -= read_len;
-	}
-}
-
-/*
- * Write begin - prepare page for write
- */
-int cfs_write_begin(struct file *file, struct address_space *mapping,
-		    loff_t pos, unsigned len, struct folio **foliop,
-		    void **fsdata)
-{
-	struct inode *inode = mapping->host;
-	struct cfs_inode_info *ci = CFS_I(inode);
-	struct cfs_fs_info *fsi = CFS_SB(inode->i_sb);
-	struct folio *folio;
-	int ret;
-
-	cfs_debug("write_begin: ino=%llu, pos=%lld, len=%u\n",
-		  ci->i_ino, pos, len);
-
-	/* Get or create folio */
-	folio = __filemap_get_folio(mapping, pos >> PAGE_SHIFT,
-				    FGP_WRITEBEGIN | FGP_CREAT | FGP_LOCK,
-				    mapping->gfp_mask);
-	if (!folio)
-		return -ENOMEM;
-
-	/* If not uptodate, read from RADOS */
-	if (!folio_test_uptodate(folio)) {
-		u64 offset = folio_pos(folio);
-		u32 part_num = cfs_part_num(offset);
-		struct ceph_object_id oid;
-		struct page *page = folio_page(folio, 0);
-		u64 file_size = i_size_read(inode);
-
-		/* If writing to new area beyond EOF, just zero */
-		if (offset >= file_size) {
-			folio_zero_segment(folio, 0, folio_size(folio));
-		} else {
-			/* Read existing data */
-			size_t read_len = min(folio_size(folio),
-					      file_size - offset);
-
-			cfs_data_oid(&oid, ci->i_ino, part_num);
-			ret = cfs_data_read(fsi, &oid, cfs_part_offset(offset),
-					    read_len, &page, 1);
-			if (ret && ret != -ENOENT) {
-				folio_unlock(folio);
-				folio_put(folio);
-				return ret;
-			}
-
-			/* Zero unread portion */
-			if (read_len < folio_size(folio))
-				folio_zero_segment(folio, read_len,
-						   folio_size(folio));
-		}
-
-		folio_mark_uptodate(folio);
-	}
-
-	*foliop = folio;
-	*fsdata = NULL;
-	return 0;
-}
-
-/*
- * Write end - commit write to RADOS
- */
-int cfs_write_end(struct file *file, struct address_space *mapping,
-		  loff_t pos, unsigned len, unsigned copied,
-		  struct folio *folio, void *fsdata)
-{
-	struct inode *inode = mapping->host;
-	struct cfs_inode_info *ci = CFS_I(inode);
-	struct cfs_fs_info *fsi = CFS_SB(inode->i_sb);
-	struct timespec64 now;
-	u64 offset = pos;
-	u64 write_len = copied;
-	u32 part_num;
-	struct ceph_object_id oid;
-	struct page *page = folio_page(folio, 0);
-	int ret;
-
-	cfs_debug("write_end: ino=%llu, pos=%lld, len=%u, copied=%u\n",
-		  ci->i_ino, pos, len, copied);
-
-	/* Update file size if needed */
-	if (pos + copied > i_size_read(inode)) {
-		i_size_write(inode, pos + copied);
-		ci->i_blocks = cfs_max_part(i_size_read(inode));
-	}
-
-	/* Calculate which data object/part to write */
-	part_num = cfs_part_num(offset);
-
-	/* Write to RADOS */
-	cfs_data_oid(&oid, ci->i_ino, part_num);
-	ret = cfs_data_write(fsi, &oid, cfs_part_offset(offset),
-			     write_len, &page, 1);
-	if (ret) {
-		cfs_err("write_end: failed to write: %d\n", ret);
-		folio_unlock(folio);
-		folio_put(folio);
-		return ret;
-	}
-
-	/* Update inode metadata */
-	now = current_time(inode);
-	spin_lock(&inode->i_lock);
-	inode->i_mtime = now;
-	inode_set_ctime(inode, now.tv_sec, now.tv_nsec);
-	spin_unlock(&inode->i_lock);
-
-	/* Mark page dirty */
-	folio_mark_uptodate(folio);
-	folio_unlock(folio);
-	folio_put(folio);
-
-	return copied;
-}
 
 /*
  * Read data from file spanning multiple 4MB chunks
+ * Used by netfs_request_ops.issue_read callback
  */
 int cfs_read_data(struct cfs_fs_info *fsi, u64 ino, u64 offset,
 		  u64 length, struct page **pages, int num_pages)
@@ -276,7 +52,6 @@ int cfs_read_data(struct cfs_fs_info *fsi, u64 ino, u64 offset,
 		u64 chunk_len = min(remaining, CFS_BLOCK_SIZE - part_offset);
 		struct ceph_object_id oid;
 		int pages_in_chunk;
-		int i;
 
 		cfs_data_oid(&oid, ino, part_num);
 
@@ -303,6 +78,7 @@ int cfs_read_data(struct cfs_fs_info *fsi, u64 ino, u64 offset,
 
 /*
  * Write data to file spanning multiple 4MB chunks
+ * Used by netfs_request_ops callbacks
  */
 int cfs_write_data(struct cfs_fs_info *fsi, u64 ino, u64 offset,
 		   u64 length, struct page **pages, int num_pages,
@@ -322,7 +98,6 @@ int cfs_write_data(struct cfs_fs_info *fsi, u64 ino, u64 offset,
 		u64 chunk_len = min(remaining, CFS_BLOCK_SIZE - part_offset);
 		struct ceph_object_id oid;
 		int pages_in_chunk;
-		int i;
 
 		cfs_data_oid(&oid, ino, part_num);
 
@@ -346,8 +121,9 @@ int cfs_write_data(struct cfs_fs_info *fsi, u64 ino, u64 offset,
 
 	/* Update metadata timestamps */
 	if (mtime) {
-		mtime->tv_sec = current_time(fsi->sb).tv_sec;
-		mtime->tv_nsec = current_time(fsi->sb).tv_nsec;
+		struct timespec64 now = current_time(fsi->sb);
+		mtime->tv_sec = now.tv_sec;
+		mtime->tv_nsec = now.tv_nsec;
 	}
 
 	return 0;
@@ -423,16 +199,163 @@ int cfs_delete_data_objects(struct cfs_fs_info *fsi, u64 ino, u32 max_part)
 }
 
 /*
- * Address space operations
+ * Write a single page to RADOS - follows ceph_writepage pattern
+ * Netfs framework handles writeback via create_write_requests callback
+ */
+static int cfs_writepage(struct page *page, struct writeback_control *wbc)
+{
+	struct folio *folio = page_folio(page);
+	struct inode *inode = folio->mapping->host;
+	struct cfs_inode_info *ci = CFS_I(inode);
+
+	cfs_debug("writepage: ino=%llu, offset=%llu\n",
+		  ci->i_ino, folio_pos(folio));
+
+	/* Netfs framework handles writeback via create_write_requests callback */
+	return netfs_writepage(page, wbc);
+}
+
+/*
+ * Write multiple pages - follows ceph_writepages_start pattern
+ * All writes go through netfs framework
+ */
+static int cfs_writepages(struct address_space *mapping,
+			  struct writeback_control *wbc)
+{
+	struct inode *inode = mapping->host;
+	struct cfs_inode_info *ci = CFS_I(inode);
+
+	cfs_debug("writepages: ino=%llu\n", ci->i_ino);
+
+	/* All writes go through netfs framework */
+	return netfs_writepages(mapping, wbc);
+}
+
+/*
+ * Write begin - follows ceph_write_begin pattern (fs/ceph/addr.c:1503-1520)
+ * Wraps netfs_write_begin, converting folio to page
+ */
+static int cfs_write_begin(struct file *file, struct address_space *mapping,
+			   loff_t pos, unsigned len,
+			   struct page **pagep, void **fsdata)
+{
+	struct inode *inode = file_inode(file);
+	struct cfs_inode_info *ci = CFS_I(inode);
+	struct folio *folio = NULL;
+	int ret;
+
+	cfs_debug("write_begin: ino=%llu, pos=%lld, len=%u\n",
+		  ci->i_ino, pos, len);
+
+	ret = netfs_write_begin(&ci->netfs, file, inode->i_mapping,
+				pos, len, &folio, fsdata);
+	if (ret < 0)
+		return ret;
+
+	WARN_ON_ONCE(!folio_test_locked(folio));
+	*pagep = &folio->page;
+	return 0;
+}
+
+/*
+ * Write end - follows ceph_write_end pattern (fs/ceph/addr.c:1526-1561)
+ * Netfs framework handles most of the work
+ */
+static int cfs_write_end(struct file *file, struct address_space *mapping,
+			  loff_t pos, unsigned len, unsigned copied,
+			  struct page *page, void *fsdata)
+{
+	struct folio *folio = page_folio(page);
+	struct inode *inode = file_inode(file);
+	struct cfs_inode_info *ci = CFS_I(inode);
+	loff_t last_pos = pos + copied;
+
+	cfs_debug("write_end: ino=%llu, pos=%lld, len=%u, copied=%u\n",
+		  ci->i_ino, pos, len, copied);
+
+	if (!folio_test_uptodate(folio)) {
+		/* just return that nothing was copied on a short copy */
+		if (copied < len) {
+			copied = 0;
+			goto out;
+		}
+		folio_mark_uptodate(folio);
+	}
+
+	/* did file size increase? */
+	if (last_pos > i_size_read(inode))
+		i_size_write(inode, last_pos);
+
+	folio_mark_dirty(folio);
+out:
+	folio_unlock(folio);
+	folio_put(folio);
+
+	return copied;
+}
+
+/*
+ * Invalidate folio - follows ceph_invalidate_folio pattern (fs/ceph/addr.c:137-163)
+ * Just call netfs_invalidate_folio directly
+ */
+static void cfs_invalidate_folio(struct folio *folio, size_t offset,
+				 size_t length)
+{
+	struct inode *inode = folio->mapping->host;
+
+	cfs_debug("invalidate_folio: ino=%llu, offset=%zu, length=%zu\n",
+		  CFS_I(inode)->i_ino, offset, length);
+
+	/* Direct call to netfs, matching ceph behavior */
+	netfs_invalidate_folio(folio, offset, length);
+}
+
+/*
+ * Dirty folio - follows ceph_dirty_folio pattern (fs/ceph/addr.c:80-130)
+ * Use netfs_dirty_folio for proper netfs integration
+ * CFS doesn't need snap context tracking like Ceph, so use simplified version
+ */
+static bool cfs_dirty_folio(struct address_space *mapping, struct folio *folio)
+{
+	struct inode *inode = mapping->host;
+	struct cfs_inode_info *ci = CFS_I(inode);
+
+	cfs_debug("dirty_folio: ino=%llu, index=%lu\n", ci->i_ino, folio->index);
+
+	/* Use netfs_dirty_folio like ceph does via ceph_fscache_dirty_folio */
+	return netfs_dirty_folio(mapping, folio);
+}
+
+/*
+ * Address space operations - optimized to match ceph_aops pattern
+ *
+ * Reference: fs/ceph/addr.c:1563-1574
+ *
+ * Comparison with ceph_aops:
+ * ┌─────────────────────┬────────────────────┬─────────────────────┐
+ * │ Operation           │ ceph_aops          │ cfs_aops            │
+ * ├─────────────────────┼────────────────────┼─────────────────────┤
+ * │ read_folio          │ netfs_read_folio   │ netfs_read_folio    │
+ * │ readahead           │ netfs_readahead    │ netfs_readahead     │
+ * │ writepage           │ ceph_writepage     │ cfs_writepage       │
+ * │ writepages          │ ceph_writepages    │ cfs_writepages      │
+ * │ write_begin         │ ceph_write_begin   │ cfs_write_begin     │
+ * │ write_end           │ ceph_write_end     │ cfs_write_end       │
+ * │ dirty_folio         │ ceph_dirty_folio   │ cfs_dirty_folio     │
+ * │ invalidate_folio    │ ceph_invalidate    │ cfs_invalidate      │
+ * │ release_folio       │ netfs_release      │ netfs_release_folio │
+ * │ direct_IO           │ noop_direct_IO     │ noop_direct_IO      │
+ * └─────────────────────┴────────────────────┴─────────────────────┘
  */
 const struct address_space_operations cfs_aops = {
-	.read_folio     = cfs_read_folio,
-	.readahead      = cfs_readahead,
-	.write_begin    = cfs_write_begin,
-	.write_end      = cfs_write_end,
-	.dirty_folio    = filemap_dirty_folio,
-	.migrate_folio  = filemap_migrate_folio,
-	.invalidate_folio = filemap_invalidate_folio,
-	.release_folio  = filemap_release_folio,
-	.is_partially_uptodate = filemap_is_partially_uptodate,
+	.read_folio		= netfs_read_folio,
+	.readahead		= netfs_readahead,
+	.writepage		= cfs_writepage,
+	.writepages		= cfs_writepages,
+	.write_begin		= cfs_write_begin,
+	.write_end		= cfs_write_end,
+	.dirty_folio		= cfs_dirty_folio,
+	.invalidate_folio	= cfs_invalidate_folio,
+	.release_folio		= netfs_release_folio,
+	.direct_IO		= noop_direct_IO,
 };

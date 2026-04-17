@@ -324,6 +324,19 @@ int cfs_inode_init(struct inode *inode, struct cfs_dentry_metadata *dmeta)
 
 	inode->i_mapping->a_ops = &cfs_aops;
 
+	/*
+	 * Update netfs context with the file size from metadata.
+	 * This ensures remote_i_size is correctly set for netfs I/O operations.
+	 */
+	ci->netfs.remote_i_size = i_size_read(inode);
+
+	/*
+	 * Note: netfs_inode_init is called in cfs_alloc_inode.
+	 * The netfs context is ready to use.
+	 * If netfs is not enabled (netfs_ops == NULL), the netfs
+	 * path will simply not be used for this inode.
+	 */
+
 	return 0;
 }
 

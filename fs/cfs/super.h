@@ -8,6 +8,7 @@
 #include <linux/spinlock.h>
 #include <linux/mutex.h>
 #include <linux/kref.h>
+#include <linux/netfs.h>
 
 /*
  * CFS - Ceph File System Simple
@@ -102,6 +103,8 @@ struct cfs_mount_options {
 	char *data_pool;             /* Data pool name */
 	unsigned int ino_batch_size; /* Inode batch size */
 	umode_t mode;                /* Default file mode */
+	unsigned int rsize;          /* Max read size (0 = default) */
+	unsigned int wsize;          /* Max write size (0 = default) */
 };
 
 /*
@@ -128,9 +131,15 @@ struct cfs_fs_info {
 };
 
 /*
- * CFS inode info (embedded in VFS inode)
+ * CFS inode info
+ *
+ * Note: netfs_inode is placed as the first member so that CFS_I() macro
+ * can be implemented using container_of(). The netfs_inode contains the
+ * VFS struct inode at offset 0, allowing safe casting between the types.
  */
 struct cfs_inode_info {
+	struct netfs_inode netfs;    /* netfs framework context (must be first) */
+
 	u64 i_ino;                   /* Inode number */
 	u64 i_parent_ino;            /* Parent directory inode */
 	umode_t i_mode;              /* File mode */
@@ -149,9 +158,6 @@ struct cfs_inode_info {
 	
 	/* Lock for inode operations */
 	spinlock_t i_lock;
-	
-	/* VFS inode embedded at end */
-	struct inode vfs_inode;
 };
 
 /*
@@ -165,14 +171,21 @@ struct cfs_dir_entry {
 };
 
 /* Inline functions for inode conversion */
+/*
+ * Get cfs_inode_info from VFS inode.
+ * Note: VFS inode is embedded in netfs_inode, so we need two steps:
+ * 1. Get netfs_inode from inode using netfs_inode() macro
+ * 2. Get cfs_inode_info from netfs_inode
+ */
 static inline struct cfs_inode_info *CFS_I(struct inode *inode)
 {
-	return container_of(inode, struct cfs_inode_info, vfs_inode);
+	struct netfs_inode *ctx = netfs_inode(inode);
+	return container_of(ctx, struct cfs_inode_info, netfs);
 }
 
 static inline struct inode *CFS_INODE(struct cfs_inode_info *ci)
 {
-	return &ci->vfs_inode;
+	return &ci->netfs.inode;
 }
 
 static inline struct cfs_fs_info *CFS_SB(struct super_block *sb)
@@ -314,11 +327,13 @@ extern const struct inode_operations cfs_file_inode_ops;
 extern const struct file_operations cfs_dir_file_ops;
 extern const struct file_operations cfs_file_ops;
 extern const struct address_space_operations cfs_aops;
+extern const struct netfs_request_ops cfs_netfs_ops;
 
 /* Function declarations */
 /* super.c */
 int cfs_init_fs_context(struct fs_context *fc);
 void cfs_kill_sb(struct super_block *sb);
+void cfs_update_root_inode_netfs(struct super_block *sb);
 
 /* inode.c */
 struct inode *cfs_alloc_inode(struct super_block *sb);
